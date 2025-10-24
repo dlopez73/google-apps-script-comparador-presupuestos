@@ -1,0 +1,700 @@
+/**
+ * @fileoverview SCRIPT PRINCIPAL DE COMPARACIÓN v28.0 (EFICIENCIA CONFIRMADA).
+ * - Lógica eficiente para COMP_INSUMOS confirmada (solo muestra cambios de ítems modificados).
+ * - Logs de diagnóstico de insumos eliminados para limpieza.
+ * - Mantiene todas las refactorizaciones y correcciones anteriores.
+ */
+
+// --- CONFIGURACIÓN DE NOMBRES DE HOJAS ---
+const NOMBRE_HOJA_CONFIG = 'Configuración';
+const NOMBRE_HOJA_GENERAL = 'COMP_GENERAL';
+const NOMBRE_HOJA_INSUMO = 'COMP_INSUMOS';
+const NOMBRE_HOJA_RESUMIDO = 'COMP_RESUMIDOS';
+
+// --- FUNCIONES DE INTERFAZ Y CONFIGURACIÓN ---
+function onOpen() {
+  const ui = SpreadsheetApp.getUi();
+  const menuComparacion = ui.createMenu('⚙️ Gestor de Comparación')
+      .addItem('▶️ Abrir Interfaz', 'mostrarSidebar');
+  const menuLimpieza = ui.createMenu('🗑️ Limpieza de Datos')
+      .addItem('⚠️ Limpiar Resultados', 'ejecutarLimpiezaConConfirmacion');
+  const menuTest = ui.createMenu('🧪 Pruebas de Ingeniería')
+      .addItem('Ejecutar Test de Parser de Moneda', '_testLimpiarMoneda');
+  menuComparacion.addToUi();
+  menuLimpieza.addToUi();
+  menuTest.addToUi();
+}
+function mostrarSidebar() {
+  const ui = HtmlService.createTemplateFromFile('Sidebar').evaluate().setTitle('Control de Versiones de Presupuesto');
+  SpreadsheetApp.getUi().showSidebar(ui);
+}
+function incluir(filename) {
+  return HtmlService.createHtmlOutputFromFile(filename).getContent();
+}
+function obtenerConfiguracion() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const hojaConfig = ss.getSheetByName(NOMBRE_HOJA_CONFIG);
+  if (!hojaConfig) { throw new Error(`Error de Configuración: No se encontró la hoja "${NOMBRE_HOJA_CONFIG}".`); }
+  const idCarpetaObra = hojaConfig.getRange('B1').getValue();
+  if (!idCarpetaObra) { throw new Error(`Error de Configuración: El ID de la carpeta principal de Proyectos está vacío en la celda B1.`); }
+  return { idSpreadsheet: ss.getId(), idCarpetaObra: idCarpetaObra, hojaConfig: hojaConfig };
+}
+function obtenerCausales() {
+  try {
+    const config = obtenerConfiguracion();
+    const rangoCausales = config.hojaConfig.getRange("D1:D").getValues();
+    return rangoCausales.flat().filter(causal => causal !== "");
+  } catch (e) {
+    Logger.log(`Error en obtenerCausales: ${e}`);
+    return [`Error al leer causales: ${e.message}`];
+  }
+}
+function obtenerNombresDeObras() {
+  try {
+    const config = obtenerConfiguracion();
+    const carpetaPrincipal = DriveApp.getFolderById(config.idCarpetaObra);
+    const nombresObras = [];
+    const subCarpetas = carpetaPrincipal.getFolders();
+    while (subCarpetas.hasNext()) { nombresObras.push(subCarpetas.next().getName()); }
+    return nombresObras;
+  } catch (e) { 
+    Logger.log(`Error en obtenerNombresDeObras: ${e}`);
+    throw new Error(`Error de Conexión: No se pudo leer las carpetas de proyectos. Revise el ID y los permisos de Drive.`); 
+  }
+}
+function obtenerArchivosDeObra(nombreObra) {
+  try {
+    const config = obtenerConfiguracion();
+    const carpetaPrincipal = DriveApp.getFolderById(config.idCarpetaObra);
+    const carpetasProyecto = carpetaPrincipal.getFoldersByName(nombreObra); 
+    if (!carpetasProyecto.hasNext()) { return { objetos: [], insumos: [], resumidos: [] }; } 
+    const carpetaProyecto = carpetasProyecto.next();
+    const archivos = { objetos: [], insumos: [], resumidos: [] }; 
+    ['Objeto', 'Insumo', 'Resumido'].forEach(tipo => { 
+      const tipoKey = tipo.toLowerCase() + 's';
+      const carpetas = carpetaProyecto.getFoldersByName(tipo);
+      if (carpetas.hasNext()) {
+        const archivosEnCarpeta = carpetas.next().getFiles();
+        const lista = [];
+        while (archivosEnCarpeta.hasNext()) {
+          let file = archivosEnCarpeta.next();
+          lista.push({ id: file.getId(), name: file.getName() });
+        }
+        archivos[tipoKey] = lista.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+      }
+    });
+    return archivos;
+  } catch (e) { 
+    Logger.log(`Error en obtenerArchivosDeObra: ${e}`);
+    return { objetos: [], insumos: [], resumidos: [] }; 
+  }
+}
+
+// --- LÓGICA DE CONVERSIÓN DE ARCHIVOS (ROBUSTA v26.0) ---
+function convertirExcelAArray(fileId) {
+  const file = DriveApp.getFileById(fileId);
+  const fileName = file.getName();
+  let tempFileId = null;
+  if (typeof Drive === 'undefined' || !Drive.Files) {
+    Logger.log("Error Crítico: El servicio avanzado 'Drive API' no está habilitado.");
+    throw new Error("Error Crítico: El servicio 'Drive API' no está habilitado. Contacte al administrador.");
+  }
+  try {
+    const mimeType = file.getMimeType();
+    if (mimeType !== MimeType.MICROSOFT_EXCEL && mimeType !== MimeType.MICROSOFT_EXCEL_LEGACY && mimeType !== MimeType.OOXML_SHEET) {
+      throw new Error(`El archivo '${fileName}' no es un Excel válido (MimeType: ${mimeType}).`);
+    }
+    const tempFile = Drive.Files.copy({
+      title: `TEMP_CONVERSION_${fileName}`,
+      mimeType: MimeType.GOOGLE_SHEETS
+    }, fileId);
+    tempFileId = tempFile.id;
+    const ssTemp = SpreadsheetApp.openById(tempFileId);
+    const sheet = ssTemp.getSheets()[0];
+    const data = sheet.getDataRange().getValues();
+    return data;
+  } catch (e) {
+    Logger.log(`Error en convertirExcelAArray (Archivo: ${fileName}, ID: ${fileId}): ${e}`);
+    throw new Error(`Error en la lectura de archivo: No se pudo procesar el Excel '${fileName}'. Revise formato. (${e.message})`);
+  } finally {
+    if (tempFileId) {
+      try { DriveApp.getFileById(tempFileId).setTrashed(true); } 
+      catch (e) { Logger.log(`Fallo al limpiar archivo temporal (ID: ${tempFileId}): ${e}`); }
+    }
+  }
+}
+
+// --- FUNCIÓN PRINCIPAL DE EJECUCIÓN ---
+function ejecutarComparacionDesdeUI(ids, causal, comentario) {
+  try {
+    // Logger.log('Iniciando ejecutarComparacionDesdeUI...'); // Log eliminado
+    const config = obtenerConfiguracion();
+    const ssResultados = SpreadsheetApp.openById(config.idSpreadsheet);
+    if (!ids || !ids.objetoViejo || !ids.objetoNuevo || !ids.insumoViejo || !ids.insumoNuevo || !ids.resumidoViejo || !ids.resumidoNuevo) {
+      // Logger.log('Error: Faltan IDs de archivo.'); // Log eliminado
+      return { error: 'Alerta: Faltó seleccionar uno o más de los 6 archivos de comparación.' };
+    }
+    let reporte = { objetos: 'No se procesó.', insumos: 'No se procesó.', resumidos: 'No se procesó.' };
+
+    // 1. COMPARACIÓN DE OBJETOS GENERALES (Ítems)
+    // Logger.log('Iniciando comparación de Objetos Generales...'); // Log eliminado
+    const archivoObjetoViejo = DriveApp.getFileById(ids.objetoViejo);
+    const archivoObjetoNuevo = DriveApp.getFileById(ids.objetoNuevo);
+    const datosObjetoViejos = convertirExcelAArray(ids.objetoViejo);
+    const datosObjetoNuevos = convertirExcelAArray(ids.objetoNuevo);
+    const resultadoComparacionGeneral = compararDatosObjetos(datosObjetoViejos, datosObjetoNuevos, { viejo: archivoObjetoViejo, nuevo: archivoObjetoNuevo });
+    // Logger.log(`Comparación General: ${resultadoComparacionGeneral.diferencias.length} diferencias encontradas.`); // Log eliminado
+    // Logger.log(`Ítems modificados para revisar en Insumos: ${resultadoComparacionGeneral.itemsModificados.size} ítems.`); // Log eliminado
+
+    const datosFinalesObjeto = resultadoComparacionGeneral.diferencias.map((fila, index) => {
+      fila.push(new Date()); 
+      fila.push(`=HYPERLINK("${archivoObjetoViejo.getUrl()}", "${archivoObjetoViejo.getName()}")`); 
+      fila.push(`=HYPERLINK("${archivoObjetoNuevo.getUrl()}", "${archivoObjetoNuevo.getName()}")`); 
+      fila.push(causal); 
+      fila.push(index === 0 ? comentario : ''); 
+      return fila;
+    });
+    escribirResultadosEnHoja(ssResultados, NOMBRE_HOJA_GENERAL, getHeaderGeneral(), datosFinalesObjeto);
+    reporte.objetos = `Comparación de Objetos exitosa.`;
+    // Logger.log('Comparación de Objetos Generales finalizada.'); // Log eliminado
+    
+    // 2. COMPARACIÓN DE INSUMOS
+    // Logger.log('Iniciando comparación de Insumos...'); // Log eliminado
+    const archivoInsumoViejo = DriveApp.getFileById(ids.insumoViejo);
+    const archivoInsumoNuevo = DriveApp.getFileById(ids.insumoNuevo);
+    const datosInsumoViejos = convertirExcelAArray(ids.insumoViejo);
+    const datosInsumoNuevos = convertirExcelAArray(ids.insumoNuevo);
+    
+    // Logger.log(`Llamando a compararDatosInsumos con ${resultadoComparacionGeneral.itemsModificados.size} ítems modificados.`); // Log eliminado
+    const resultadoComparacionInsumos = compararDatosInsumos(datosInsumoViejos, datosInsumoNuevos, resultadoComparacionGeneral.itemsModificados, { viejo: archivoInsumoViejo, nuevo: archivoInsumoNuevo });
+    // Logger.log(`compararDatosInsumos devolvió ${resultadoComparacionInsumos.length} diferencias.`); // Log eliminado
+
+    resultadoComparacionInsumos.sort((a, b) => String(a[0]).localeCompare(String(b[0]), undefined, { numeric: true }));
+    const datosFinalesInsumos = resultadoComparacionInsumos.map((fila, index) => {
+      fila.push(new Date()); 
+      fila.push(`=HYPERLINK("${archivoInsumoViejo.getUrl()}", "${archivoInsumoViejo.getName()}")`); 
+      fila.push(`=HYPERLINK("${archivoInsumoNuevo.getUrl()}", "${archivoInsumoNuevo.getName()}")`); 
+      fila.push(causal); 
+      const comentarioParaInsumo = (datosFinalesObjeto.length === 0 && index === 0) ? comentario : '';
+      fila.push(comentarioParaInsumo); 
+      return fila;
+    });
+    
+    // Logger.log(`Preparados ${datosFinalesInsumos.length} filas para escribir en COMP_INSUMOS.`); // Log eliminado
+    escribirResultadosEnHoja(ssResultados, NOMBRE_HOJA_INSUMO, getHeaderInsumo(), datosFinalesInsumos);
+    reporte.insumos = `Comparación de Insumos exitosa.`;
+    // Logger.log('Comparación de Insumos finalizada.'); // Log eliminado
+
+    // 3. COMPARACIÓN DE OBJETOS RESUMIDOS
+    // Logger.log('Iniciando comparación de Resumidos...'); // Log eliminado
+    const archivoResumidoViejo = DriveApp.getFileById(ids.resumidoViejo);
+    const archivoResumidoNuevo = DriveApp.getFileById(ids.resumidoNuevo);
+    const datosResumidoViejos = convertirExcelAArray(ids.resumidoViejo);
+    const datosResumidoNuevos = convertirExcelAArray(ids.resumidoNuevo);
+    const resultadoComparacionResumidos = compararDatosResumidos(datosResumidoViejos, datosResumidoNuevos, { viejo: archivoResumidoViejo, nuevo: archivoResumidoNuevo });
+    // Logger.log(`Comparación Resumidos: ${resultadoComparacionResumidos.length} diferencias encontradas (incluye 'Sin Cambios').`); // Log eliminado
+
+    const datosFinalesResumidos = resultadoComparacionResumidos.map((fila, index) => {
+      fila.push(new Date()); 
+      fila.push(`=HYPERLINK("${archivoResumidoViejo.getUrl()}", "${archivoResumidoViejo.getName()}")`); 
+      fila.push(`=HYPERLINK("${archivoResumidoNuevo.getUrl()}", "${archivoResumidoNuevo.getName()}")`); 
+      fila.push(causal); 
+      fila.push(index === 0 ? comentario : ''); 
+      return fila;
+    });
+    escribirResultadosEnHoja(ssResultados, NOMBRE_HOJA_RESUMIDO, getHeaderResumido(), datosFinalesResumidos);
+    reporte.resumidos = `Comparación de Resumidos exitosa.`;
+    // Logger.log('Comparación de Resumidos finalizada.'); // Log eliminado
+
+    // Logger.log('ejecutarComparacionDesdeUI finalizada exitosamente.'); // Log eliminado
+    return reporte;
+  } catch (e) { 
+    Logger.log(`ERROR FATAL en ejecutarComparacionDesdeUI: ${e}\nStack: ${e.stack}`);
+    return { error: e.toString() }; 
+  }
+}
+
+
+// --- LÓGICA DE ESCRITURA Y ENCABEZADOS (Limpia antes de escribir) ---
+function escribirResultadosEnHoja(ss, nombreHoja, headers, datos) {
+  // Logger.log(`Iniciando escribirResultadosEnHoja para ${nombreHoja} con ${datos.length} filas.`); // Log eliminado
+  if (datos.length === 0) {
+    // Logger.log(`No hay datos para escribir en la hoja: ${nombreHoja}`); // Log eliminado
+    let hojaExistente = ss.getSheetByName(nombreHoja);
+    if (hojaExistente && hojaExistente.getLastRow() > 1) {
+       try { 
+         hojaExistente.getRange(2, 1, hojaExistente.getLastRow() - 1, hojaExistente.getLastColumn()).clearContent();
+         // Logger.log(`Contenido previo limpiado en ${nombreHoja} porque no hay nuevos datos.`); // Log eliminado
+       } catch (clearError) {
+         Logger.log(`Error al limpiar ${nombreHoja}: ${clearError}`);
+       }
+    }
+    return; 
+  }
+  
+  let hoja = ss.getSheetByName(nombreHoja);
+  if (!hoja) { 
+    hoja = ss.insertSheet(nombreHoja); 
+    // Logger.log(`Hoja ${nombreHoja} creada.`); // Log eliminado
+  }
+  
+  // Limpiamos contenido excepto encabezado ANTES de escribir nuevos datos
+  if (hoja.getLastRow() > 1) {
+    try {
+      hoja.getRange(2, 1, hoja.getLastRow() - 1, hoja.getLastColumn()).clearContent();
+      // Logger.log(`Contenido previo limpiado en ${nombreHoja}.`); // Log eliminado
+    } catch (cleanError) {
+      Logger.log(`Error al limpiar contenido previo en ${nombreHoja}: ${cleanError}`);
+    }
+  }
+  
+  // Asegurar encabezado
+  if (hoja.getRange("A1").getValue() === "") {
+    try {
+       hoja.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
+       // Logger.log(`Encabezado escrito en ${nombreHoja}.`); // Log eliminado
+    } catch (headerError) {
+       Logger.log(`Error al escribir encabezado en ${nombreHoja}: ${headerError}`);
+    }
+  }
+  
+  // Escribimos siempre a partir de la fila 2
+  try {
+    if (!datos[0] || datos[0].length !== headers.length) {
+       Logger.log(`ERROR DE DIMENSIONES en ${nombreHoja}: Encabezado=${headers.length}, Datos[0]=${datos[0] ? datos[0].length : 'undefined'}. Muestra datos[0]: ${JSON.stringify(datos[0])}`);
+       throw new Error(`Discrepancia de columnas en ${nombreHoja}: Headers=${headers.length}, Datos=${datos[0] ? datos[0].length : 'N/A'}`);
+    } else {
+       hoja.getRange(2, 1, datos.length, datos[0].length).setValues(datos); 
+       // Logger.log(`${datos.length} filas escritas en ${nombreHoja}.`); // Log eliminado
+    }
+  } catch(e) {
+     Logger.log(`Error FATAL al escribir datos en ${nombreHoja}. Error: ${e}\nStack: ${e.stack}`);
+  }
+  
+  // Gestionar filtro
+  try {
+    if (hoja.getFilter() == null && hoja.getLastRow() > 1) { 
+       hoja.getDataRange().createFilter(); 
+       // Logger.log(`Filtro creado en ${nombreHoja}.`); // Log eliminado
+    } else if (hoja.getFilter() != null && hoja.getLastRow() <= 1) { 
+       hoja.getFilter().remove();
+       // Logger.log(`Filtro eliminado de ${nombreHoja} (sin datos).`); // Log eliminado
+    }
+  } catch (filterError) {
+     Logger.log(`Error al gestionar filtro en ${nombreHoja}: ${filterError}`);
+  }
+  // Logger.log(`Finalizado escribirResultadosEnHoja para ${nombreHoja}.`); // Log eliminado
+}
+
+
+// --- DEFINICIÓN DE ENCABEZADOS ---
+function getHeaderGeneral() {
+  return ["Nombre Objeto", "Clase", "Ítem", "Nombre Ítem", "Estado", "Valor Viejo", "Valor Nuevo", "Diferencia", "Valor Total Anterior", "Valor Total Nuevo", "Diferencia Total", "Fecha de generación", "Versión Anterior", "Versión Actual", "Causal", "Comentario"];
+}
+function getHeaderInsumo() {
+  return ["Ítem Principal", "Nombre Ítem", "Clasificación", "Insumo", "Nombre Insumo", "Estado", "Cantidad Anterior", "Cantidad Nueva", "Dif. Cantidad", "Vlr. Unit. Anterior", "Vlr. Unit. Nuevo", "Dif. Vlr. Unit.", "Valor Total Anterior", "Valor Total Nuevo", "Diferencia Total", "Fecha de generación", "Versión Anterior", "Versión Actual", "Causal", "Comentario"];
+}
+function getHeaderResumido() {
+  return ["Nombre", "Clase", "Estado", "Unitario Anterior", "Total anterior", "Unitario nuevo", "Total nuevo", "Diferencia Unitario", "Diferencia Total", "Fecha de generación", "Versión Anterior", "Versión Actual", "Causal", "Comentario"];
+}
+
+// --- LÓGICA DE COMPARACIÓN DE OBJETOS GENERALES (Mapeo Original) ---
+// ... (Se mantiene igual que v27.0) ...
+function compararDatosObjetos(datosViejos, datosNuevos, archivos) {
+  const mapaViejos = crearMapaDeObjetos(datosViejos);
+  const mapaNuevos = crearMapaDeObjetos(datosNuevos);
+  const diferencias = [];
+  const itemsModificados = new Set();
+  for (const llave in mapaNuevos) {
+    const dataNueva = mapaNuevos[llave];
+    const itemCode = dataNueva.fila[0].toString().trim();
+    if (mapaViejos[llave]) {
+      const dataVieja = mapaViejos[llave];
+      const cantVieja = parseFloat(String(dataVieja.fila[4] || 0).replace(/,/g, ''));
+      const cantNueva = parseFloat(String(dataNueva.fila[4] || 0).replace(/,/g, ''));
+      const vlrViejo = parseFloat(String(dataVieja.fila[6] || 0).replace(/,/g, ''));
+      const vlrNuevo = parseFloat(String(dataNueva.fila[6] || 0).replace(/,/g, ''));
+      const cambioEnCantidad = cantVieja !== cantNueva;
+      const cambioEnValor = vlrViejo !== vlrNuevo;
+      if (cambioEnCantidad || cambioEnValor) {
+        itemsModificados.add(itemCode);
+        if (cambioEnCantidad && cambioEnValor) {
+          diferencias.push(formatearFilaGeneral(dataNueva, dataVieja, 'Cantidad Modificada'));
+          diferencias.push(formatearFilaGeneral(dataNueva, dataVieja, 'Valor Modificado'));
+        } else if (cambioEnCantidad) {
+          diferencias.push(formatearFilaGeneral(dataNueva, dataVieja, 'Cantidad Modificada'));
+        } else if (cambioEnValor) {
+          diferencias.push(formatearFilaGeneral(dataNueva, dataVieja, 'Valor Modificado'));
+        }
+      }
+    } else {
+      itemsModificados.add(itemCode);
+      diferencias.push(formatearFilaGeneral(dataNueva, null, 'Item Agregado'));
+    }
+  }
+  for (const llave in mapaViejos) {
+    if (!mapaNuevos[llave]) {
+      const dataVieja = mapaViejos[llave];
+      const itemCode = dataVieja.fila[0].toString().trim();
+      itemsModificados.add(itemCode);
+      diferencias.push(formatearFilaGeneral(null, dataVieja, 'Item Eliminado'));
+    }
+  }
+  return { diferencias, itemsModificados };
+}
+function formatearFilaGeneral(dataNueva, dataVieja, estado) { 
+  const dataBase = estado === 'Item Eliminado' ? dataVieja : dataNueva;
+  if (!dataBase || !dataBase.fila) {
+     Logger.log(`ERROR en formatearFilaGeneral: dataBase o dataBase.fila es undefined. Estado: ${estado}`);
+     return []; 
+  }
+  const filaBase = dataBase.fila;
+  const nombreObjeto = dataBase.nombreObjeto;
+  const claseObjeto = dataBase.claseObjeto;
+  const cantVieja = !dataVieja ? 0 : parseFloat(String(dataVieja.fila[4] || 0).replace(/,/g, ''));
+  const cantNueva = !dataNueva ? 0 : parseFloat(String(dataNueva.fila[4] || 0).replace(/,/g, ''));
+  const vlrViejo = !dataVieja ? 0 : parseFloat(String(dataVieja.fila[6] || 0).replace(/,/g, ''));
+  const vlrNuevo = !dataNueva ? 0 : parseFloat(String(dataNueva.fila[6] || 0).replace(/,/g, ''));
+  const valorTotalRealViejo = !dataVieja ? 0 : parseFloat(String(dataVieja.fila[7] || 0).replace(/,/g, ''));
+  const valorTotalRealNuevo = !dataNueva ? 0 : parseFloat(String(dataNueva.fila[7] || 0).replace(/,/g, ''));
+  let valorViejoCol, valorNuevoCol, diferenciaCol, difTotalFila, vlrTotalAntFila, vlrTotalNueFila;
+  const ambosCambiaron = cantVieja !== cantNueva && vlrViejo !== vlrNuevo;
+  switch (estado) {
+    case 'Cantidad Modificada':
+      valorViejoCol = cantVieja; valorNuevoCol = cantNueva; diferenciaCol = cantNueva - cantVieja;
+      difTotalFila = (cantNueva - cantVieja) * vlrViejo;
+      vlrTotalAntFila = valorTotalRealViejo; vlrTotalNueFila = valorTotalRealViejo + difTotalFila;
+      break;
+    case 'Valor Modificado':
+      valorViejoCol = vlrViejo; valorNuevoCol = vlrNuevo; diferenciaCol = vlrNuevo - vlrViejo;
+      difTotalFila = (vlrNuevo - vlrViejo) * cantNueva;
+      if (ambosCambiaron) { vlrTotalAntFila = cantNueva * vlrViejo; vlrTotalNueFila = valorTotalRealNuevo; } 
+      else { vlrTotalAntFila = valorTotalRealViejo; vlrTotalNueFila = valorTotalRealNuevo; }
+      break;
+    case 'Item Agregado':
+      valorViejoCol = 0; valorNuevoCol = cantNueva; diferenciaCol = cantNueva;
+      difTotalFila = valorTotalRealNuevo; vlrTotalAntFila = 0; vlrTotalNueFila = valorTotalRealNuevo;
+      break;
+    case 'Item Eliminado':
+      valorViejoCol = cantVieja; valorNuevoCol = 0; diferenciaCol = -cantVieja;
+      difTotalFila = -valorTotalRealViejo; vlrTotalAntFila = valorTotalRealViejo; vlrTotalNueFila = 0;
+      break;
+  }
+  return [nombreObjeto, claseObjeto, filaBase[0], filaBase[1], estado, valorViejoCol, valorNuevoCol, diferenciaCol, 
+          vlrTotalAntFila, vlrTotalNueFila, difTotalFila]; 
+}
+
+// --- LÓGICA DE COMPARACIÓN DE OBJETOS RESUMIDOS (MÓDULO v27.0) ---
+// ... (Se mantiene igual que v27.0) ...
+function compararDatosResumidos(datosViejos, datosNuevos, archivos) {
+  const mapaViejos = crearMapaDeResumidos(datosViejos); 
+  const mapaNuevos = crearMapaDeResumidos(datosNuevos);
+  const diferencias = [];
+  for (const llaveNombre in mapaNuevos) {
+    const dataNueva = mapaNuevos[llaveNombre];
+    if (mapaViejos[llaveNombre]) {
+      const dataVieja = mapaViejos[llaveNombre];
+      const cambioEnUnitario = dataVieja.vlrUnitario !== dataNueva.vlrUnitario;
+      const cambioEnTotal = dataVieja.vlrTotal !== dataNueva.vlrTotal;
+      let estadoItem = "Sin Cambios"; 
+      if (cambioEnUnitario || cambioEnTotal) { estadoItem = "Item Modificado"; }
+      diferencias.push(formatearFilaResumido(dataNueva, dataVieja, estadoItem)); 
+      mapaViejos[llaveNombre].revisado = true;
+    } else {
+      diferencias.push(formatearFilaResumido(dataNueva, null, 'Item Agregado'));
+    }
+  }
+  for (const llaveNombre in mapaViejos) {
+    if (!mapaViejos[llaveNombre].revisado) {
+      diferencias.push(formatearFilaResumido(null, mapaViejos[llaveNombre], 'Item Eliminado'));
+    }
+  }
+  return diferencias;
+}
+function crearMapaDeResumidos(data) {
+  function limpiarMoneda(valor) {
+    if (valor === null || valor === undefined) return 0;
+    let str = String(valor).trim();
+    if (str === "") return 0;
+    const hasComma = str.includes(',');
+    const hasPeriod = str.includes('.');
+    if (hasComma && hasPeriod && str.lastIndexOf(',') > str.lastIndexOf('.')) {
+      str = str.replace(/\./g, ''); str = str.replace(',', '.');
+    } else if (hasComma && hasPeriod && str.lastIndexOf('.') > str.lastIndexOf(',')) {
+      str = str.replace(/,/g, '');
+    } else if (hasComma && !hasPeriod) {
+      str = str.replace(',', '.');
+    }
+    const cleanString = str.replace(/[^0-9.-]/g, '');
+    const num = parseFloat(cleanString);
+    return isNaN(num) ? 0 : num;
+  }
+  const mapa = {};
+  for (const fila of data) {
+    if (!fila || fila.length < 7) continue; 
+    const nombre = fila[1] ? fila[1].toString().trim() : ''; 
+    const vlrUnitarioRaw = fila[4]; 
+    const vlrTotalRaw = fila[5]; 
+    const clase = fila[6] ? fila[6].toString().trim() : 'N/A'; 
+    const vlrUnitarioLimpio = limpiarMoneda(vlrUnitarioRaw);
+    if (nombre && vlrUnitarioRaw !== null && !isNaN(vlrUnitarioLimpio) && vlrUnitarioLimpio !== 0) { 
+      mapa[nombre] = {
+        nombre: nombre,
+        clase: clase, 
+        vlrUnitario: vlrUnitarioLimpio,
+        vlrTotal: limpiarMoneda(vlrTotalRaw), 
+        revisado: false
+      };
+    }
+  }
+  return mapa;
+}
+function formatearFilaResumido(dataNueva, dataVieja, estado) { 
+  const nombre = dataNueva ? dataNueva.nombre : dataVieja.nombre;
+  const clase = dataNueva ? dataNueva.clase : (dataVieja ? dataVieja.clase : 'N/A'); 
+  const unitViejo = dataVieja ? dataVieja.vlrUnitario : 0;
+  const totalViejo = dataVieja ? dataVieja.vlrTotal : 0;
+  const unitNuevo = dataNueva ? dataNueva.vlrUnitario : 0;
+  const totalNuevo = dataNueva ? dataNueva.vlrTotal : 0;
+  const difUnit = unitNuevo - unitViejo;
+  const difTotal = totalNuevo - totalViejo;
+  return [ nombre, clase, estado, unitViejo, totalViejo, unitNuevo, totalNuevo, difUnit, difTotal ];
+}
+
+// --- LÓGICA DE COMPARACIÓN DE INSUMOS (BLINDAJE v26.2 - SIN LOGS EXTRAS) ---
+function compararDatosInsumos(datosViejos, datosNuevos, itemsModificados, archivos) {
+  // Logger.log(`Iniciando compararDatosInsumos. Recibidos ${itemsModificados.size} ítems modificados.`); // Log eliminado
+  const mapaViejos = crearMapaDeInsumos(datosViejos);
+  const mapaNuevos = crearMapaDeInsumos(datosNuevos);
+  // Logger.log(`Mapas de insumos creados. Viejo: ${Object.keys(mapaViejos).length} entradas. Nuevo: ${Object.keys(mapaNuevos).length} entradas.`); // Log eliminado
+  const diferencias = [];
+  // let insumosProcesados = 0, insumosModificados = 0, insumosAgregados = 0, insumosEliminados = 0; // Contadores eliminados
+
+  for (const llave in mapaNuevos) {
+    const dataNueva = mapaNuevos[llave];
+    if (!itemsModificados.has(dataNueva.itemPrincipalCodigo)) { continue; } 
+    // insumosProcesados++; // Contador eliminado
+    const dataVieja = mapaViejos[llave];
+    if (dataVieja) {
+      dataVieja.revisado = true;
+      const cantVieja = parseFloat(String(dataVieja.fila[4] || 0).replace(/,/g, ''));
+      const cantNueva = parseFloat(String(dataNueva.fila[4] || 0).replace(/,/g, ''));
+      const vlrViejo = parseFloat(String(dataVieja.fila[5] || 0).replace(/,/g, ''));
+      const vlrNuevo = parseFloat(String(dataNueva.fila[5] || 0).replace(/,/g, ''));
+      if (cantVieja !== cantNueva || vlrViejo !== vlrNuevo) {
+        // insumosModificados++; // Contador eliminado
+        diferencias.push(formatearFilaInsumo(dataNueva, dataVieja, 'Insumo Modificado')); 
+      }
+    } else {
+      // insumosAgregados++; // Contador eliminado
+      diferencias.push(formatearFilaInsumo(dataNueva, null, 'Insumo Agregado')); 
+    }
+  }
+  for (const llave in mapaViejos) {
+    const dataVieja = mapaViejos[llave];
+    if (!dataVieja.revisado && itemsModificados.has(dataVieja.itemPrincipalCodigo)) { 
+        // insumosEliminados++; // Contador eliminado
+        diferencias.push(formatearFilaInsumo(null, dataVieja, 'Insumo Eliminado')); 
+    }
+  }
+  // Logger.log(`Fin compararDatosInsumos. Procesados: ${insumosProcesados}. Modificados: ${insumosModificados}, Agregados: ${insumosAgregados}, Eliminados: ${insumosEliminados}. Total diferencias: ${diferencias.length}`); // Log eliminado
+  return diferencias;
+}
+function crearMapaDeInsumos(data) {
+  // ... (Se mantiene igual que v26.2, con validación robusta) ...
+   const mapa = {};
+  let itemPrincipalActual = { codigo: 'N/A', nombre: 'N/A' };
+  let clasificacionActual = 'N/A';
+  for (let i = 0; i < data.length; i++) {
+    const fila = data[i];
+    if (!fila || fila.length < 5 || !fila[0]) continue; 
+    const colA = fila[0].toString().trim();
+    const cantidadRaw = fila[4]; 
+    const cantidad = (cantidadRaw !== null && cantidadRaw !== undefined) ? String(cantidadRaw).trim() : '';
+    if (colA.match(/^\d+(\.\d+)*\s*-\s*/) && cantidad === '') {
+        const itemData = colA.split(' - ');
+        const itemCodigo = itemData.shift().trim();
+        const itemNombre = normalizarNombre(itemData.join(' - '));
+        if (itemCodigo.includes('.')) { 
+            itemPrincipalActual = { codigo: itemCodigo, nombre: itemNombre };
+            clasificacionActual = 'N/A';
+        }
+    } else if (colA.includes(' - ') && cantidad !== '' && !isNaN(parseFloat(cantidad.replace(/,/g, '')))) {
+        const insumoData = colA.split(' - ');
+        const insumoCodigo = insumoData.shift().trim();
+        const insumoNombre = normalizarNombre(insumoData.join(' - '));
+        if (insumoCodigo && !isNaN(parseInt(insumoCodigo, 10)) && insumoNombre) {
+            const llave = `${itemPrincipalActual.codigo}-${insumoCodigo}`;
+            mapa[llave] = {
+                fila: fila, 
+                itemPrincipalCodigo: itemPrincipalActual.codigo,
+                itemPrincipalNombre: itemPrincipalActual.nombre,
+                clasificacion: clasificacionActual,
+                revisado: false
+            };
+        } else {
+             // Logger.log(`ADVERTENCIA en crearMapaDeInsumos: Se omitió fila de insumo con formato inválido en Col A: '${colA}'. Fila: ${JSON.stringify(fila)}`); // Log eliminado
+        }
+    } else if (!colA.match(/^\d/) && cantidad === '') {
+       if (colA.toLowerCase().trim() !== 'total' && !colA.toLowerCase().startsWith('capitulo')) {
+         clasificacionActual = colA;
+       }
+    } 
+  }
+  return mapa;
+}
+function formatearFilaInsumo(dataNueva, dataVieja, estado) { 
+  const dataBase = dataNueva || dataVieja;
+  if (!dataBase || !dataBase.fila) {
+     Logger.log(`ERROR en formatearFilaInsumo: dataBase o dataBase.fila es undefined. Estado: ${estado}`);
+     return []; 
+  }
+  const filaBase = dataBase.fila;
+  const colA = filaBase[0] ? String(filaBase[0]) : ''; 
+  const insumoData = colA.split(' - ');
+  const insumoCodigo = insumoData.shift() || 'N/A'; 
+  const insumoNombre = normalizarNombre(insumoData.join(' - ')) || 'Nombre Desconocido'; 
+  const itemPrincipalCodigo = dataBase.itemPrincipalCodigo;
+  const itemPrincipalNombre = dataBase.itemPrincipalNombre;
+  const cantVieja = dataVieja ? parseFloat(String(dataVieja.fila[4] || 0).replace(/,/g, '')) : 0;
+  const cantNueva = dataNueva ? parseFloat(String(dataNueva.fila[4] || 0).replace(/,/g, '')) : 0;
+  const vlrViejo = dataVieja ? parseFloat(String(dataVieja.fila[5] || 0).replace(/,/g, '')) : 0;
+  const vlrNuevo = dataNueva ? parseFloat(String(dataNueva.fila[5] || 0).replace(/,/g, '')) : 0;
+  const totalViejo = (dataVieja && dataVieja.fila.length > 8) ? parseFloat(String(dataVieja.fila[8] || 0).replace(/,/g, '')) : 0;
+  const totalNuevo = (dataNueva && dataNueva.fila.length > 8) ? parseFloat(String(dataNueva.fila[8] || 0).replace(/,/g, '')) : 0;
+  return [itemPrincipalCodigo, itemPrincipalNombre, dataBase.clasificacion, insumoCodigo, insumoNombre, 
+          estado, cantVieja, cantNueva, cantNueva - cantVieja, vlrViejo, vlrNuevo, vlrNuevo - vlrViejo, 
+          totalViejo, totalNuevo, totalNuevo - totalViejo]; 
+}
+
+// --- FUNCIONES DE LIMPIEZA (MODULAR Y CORREGIDA) ---
+// ... (Se mantiene igual que v26.1) ...
+function ejecutarLimpiezaConConfirmacion() {
+  const ui = SpreadsheetApp.getUi();
+  const response = ui.alert(
+    'ADVERTENCIA CRÍTICA DE DATOS',
+    '¿Está absolutamente seguro de que desea BORRAR TODOS LOS DATOS de COMP_GENERAL, COMP_INSUMOS y COMP_RESUMIDOS?\n\n¡Esta acción es irreversible!',
+    ui.ButtonSet.YES_NO
+  );
+  if (response === ui.Button.YES) {
+    const resultado = limpiarHojasDeResultados(); 
+    if (resultado.error) {
+      ui.alert(`Error de Limpieza: ${resultado.error}`); 
+    } else {
+      ui.alert(`Limpieza Exitosa: ${resultado.message}`);
+    }
+  } else {
+    ui.alert('Limpieza Cancelada. No se realizó ninguna acción. La data sigue firme.');
+  }
+}
+function limpiarHojasDeResultados() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const hojas = [NOMBRE_HOJA_GENERAL, NOMBRE_HOJA_INSUMO, NOMBRE_HOJA_RESUMIDO]; 
+  let hojasLimpiadas = [];
+  try {
+    hojas.forEach(nombreHoja => {
+      const hoja = ss.getSheetByName(nombreHoja);
+      if (hoja) {
+        const ultimaFila = hoja.getLastRow();
+        if (ultimaFila > 1) {
+          hoja.deleteRows(2, ultimaFila - 1);
+          hojasLimpiadas.push(nombreHoja);
+        }
+      }
+    });
+    if (hojasLimpiadas.length > 0) {
+      return { success: true, message: `Limpieza Total Exitosa: Se eliminaron datos de ${hojasLimpiadas.length} hoja(s): ${hojasLimpiadas.join(', ')}.` };
+    } else {
+      return { success: true, message: `Limpieza Finalizada: Las tres hojas de resultados ya estaban vacías.` };
+    }
+  } catch (e) {
+    Logger.log(`Error en limpiarHojasDeResultados: ${e}`);
+    return { error: `Error en la limpieza total: ${e.message}` };
+  }
+}
+
+// --- FUNCIONES AUXILIARES GENERALES ---
+// ... (Se mantiene igual que v26.1) ...
+function normalizarNombre(nombre) {
+  if (!nombre) return '';
+  return nombre.toString().toUpperCase().replace(/\s\s+/g, ' ').trim();
+}
+function crearMapaDeObjetos(data) {
+  const mapa = {};
+  let nombreObjetoActual = 'N/A';
+  let claseObjetoActual = 'N/A';
+  for (const fila of data) {
+    if (!fila || fila.length < 8 || !fila[0]) continue; 
+    const colA = fila[0].toString().trim();
+    if (colA.toLowerCase().startsWith('nombre del objeto')) {
+      nombreObjetoActual = fila[1] ? fila[1].toString().trim() : 'N/A';
+    } else if (colA.toLowerCase().startsWith('clase de objeto')) {
+      claseObjetoActual = fila[1] ? fila[1].toString().trim() : 'N/A';
+    }
+    const itemCode = fila[0];
+    const cantidadRaw = fila[4]; 
+    const cantidad = (cantidadRaw !== null && cantidadRaw !== undefined) ? String(cantidadRaw).trim() : '';
+    if (itemCode && !isNaN(parseFloat(itemCode)) && cantidad !== '' && !isNaN(parseFloat(cantidad.replace(/,/g,'')))) {
+      const llaveUnica = `${nombreObjetoActual}-${itemCode.toString().trim()}`;
+      mapa[llaveUnica] = {
+        fila: fila, 
+        nombreObjeto: nombreObjetoActual,
+        claseObjeto: claseObjetoActual
+      };
+    }
+  }
+  return mapa;
+}
+function crearHipervinculo(texto, url) {
+  // Función OBSOLETA (v26.0). 
+  return `=HYPERLINK("${url}", "${texto}")`;
+}
+
+// --- PRUEBAS UNITARIAS DE INGENIERÍA ---
+// ... (Se mantiene igual que v26.1) ...
+function _testLimpiarMoneda() {
+  function limpiarMoneda(valor) {
+    if (valor === null || valor === undefined) return 0;
+    let str = String(valor).trim();
+    if (str === "") return 0;
+    const hasComma = str.includes(',');
+    const hasPeriod = str.includes('.');
+    if (hasComma && hasPeriod && str.lastIndexOf(',') > str.lastIndexOf('.')) {
+      str = str.replace(/\./g, ''); str = str.replace(',', '.');
+    } else if (hasComma && hasPeriod && str.lastIndexOf('.') > str.lastIndexOf(',')) {
+      str = str.replace(/,/g, '');
+    } else if (hasComma && !hasPeriod) {
+      str = str.replace(',', '.');
+    }
+    const cleanString = str.replace(/[^0-9.-]/g, '');
+    const num = parseFloat(cleanString);
+    return isNaN(num) ? 0 : num;
+  }
+  const casosDePrueba = {
+    "Formato LATAM (1.234,56)": { entrada: "$ 1.234,56", esperado: 1234.56 },
+    "Formato US (1,234.56)": { entrada: "1,234.56 USD", esperado: 1234.56 },
+    "Decimal simple (1234.56)": { entrada: "1234.56", esperado: 1234.56 },
+    "Decimal con coma (1234,56)": { entrada: "1234,56", esperado: 1234.56 },
+    "Entero (1234)": { entrada: "1234", esperado: 1234 },
+    "Negativo LATAM": { entrada: "-$ 5.000,10", esperado: -5000.10 },
+    "Negativo US": { entrada: "- 1,000.50", esperado: -1000.50 }, 
+    "Texto basura": { entrada: "ABC", esperado: 0 },
+    "Nulo": { entrada: null, esperado: 0 },
+    "Vacio": { entrada: " ", esperado: 0 }
+  };
+  let resultados = "Resultados del Test de Parser de Moneda (v28.0):\n\n";
+  let fallos = 0;
+  for (const caso in casosDePrueba) {
+    const entrada = casosDePrueba[caso].entrada;
+    const esperado = casosDePrueba[caso].esperado;
+    const resultado = limpiarMoneda(entrada);
+    if (resultado === esperado) {
+      resultados += `✅ [ÉXITO] ${caso}:\n   Entrada: '${entrada}' -> Salida: ${resultado}\n\n`;
+    } else {
+      resultados += `❌ [FALLO] ${caso}:\n   Entrada: '${entrada}' -> Esperado: ${esperado}, Obtenido: ${resultado}\n\n`;
+      fallos++;
+    }
+  }
+  resultados += `--- FIN DEL TEST ---\nTotal de Fallos: ${fallos}`;
+  SpreadsheetApp.getUi().alert('Resultado de Pruebas Unitarias', resultados, SpreadsheetApp.getUi().ButtonSet.OK);
+}
